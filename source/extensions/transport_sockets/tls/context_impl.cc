@@ -171,7 +171,14 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const Envoy::Ssl::ContextConfig& c
           BIO_new_mem_buf(const_cast<char*>(tls_certificate.certificateChain().data()),
                           tls_certificate.certificateChain().size()));
       RELEASE_ASSERT(bio != nullptr, "");
-      ctx.cert_chain_.reset(PEM_read_bio_X509_AUX(bio.get(), nullptr, nullptr, nullptr));
+      bool is_pem_cert = false;
+      const uint8_t* cert_data = reinterpret_cast<const uint8_t*>(tls_certificate.certificateChain().data());
+      ctx.cert_chain_.reset(d2i_X509(nullptr, &cert_data, tls_certificate.certificateChain().size()));
+      if (ctx.cert_chain_ == nullptr) {
+        ERR_clear_error();
+        is_pem_cert = true;
+        ctx.cert_chain_.reset(PEM_read_bio_X509_AUX(bio.get(), nullptr, nullptr, nullptr));
+      }
       if (ctx.cert_chain_ == nullptr ||
           !SSL_CTX_use_certificate(ctx.ssl_ctx_.get(), ctx.cert_chain_.get())) {
         while (uint64_t err = ERR_get_error()) {
@@ -184,7 +191,7 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const Envoy::Ssl::ContextConfig& c
             absl::StrCat("Failed to load certificate chain from ", ctx.cert_chain_file_path_));
       }
       // Read rest of the certificate chain.
-      while (true) {
+      while (is_pem_cert) {
         bssl::UniquePtr<X509> cert(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
         if (cert == nullptr) {
           break;
@@ -292,11 +299,20 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const Envoy::Ssl::ContextConfig& c
         bio.reset(BIO_new_mem_buf(const_cast<char*>(tls_certificate.privateKey().data()),
                                   tls_certificate.privateKey().size()));
         RELEASE_ASSERT(bio != nullptr, "");
+
         bssl::UniquePtr<EVP_PKEY> pkey(
-            PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr,
+            d2i_PKCS8PrivateKey_bio(bio.get(), nullptr, nullptr,
                                     !tls_certificate.password().empty()
                                         ? const_cast<char*>(tls_certificate.password().c_str())
                                         : nullptr));
+        if (pkey == nullptr) {
+          ERR_clear_error();
+          pkey.reset(
+              PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr,
+                                      !tls_certificate.password().empty()
+                                          ? const_cast<char*>(tls_certificate.password().c_str())
+                                          : nullptr));
+        }
 
         if (pkey == nullptr || !SSL_CTX_use_PrivateKey(ctx.ssl_ctx_.get(), pkey.get())) {
           throw EnvoyException(fmt::format("Failed to load private key from {}, Cause: {}",
